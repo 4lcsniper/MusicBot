@@ -25,9 +25,8 @@ def load_data():
         try:
             with open(DATA_FILE, "r") as f:
                 data = json.load(f)
-                # Convert user IDs back to integers
                 allowed = set(int(uid) for uid in data.get("allowed_users", []))
-                allowed.add(OWNER_ID) # Always ensure owner is included
+                allowed.add(OWNER_ID)
                 return allowed, data.get("usage_count", 0)
         except Exception:
             return {OWNER_ID}, 0
@@ -51,7 +50,6 @@ class MusicBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
-        # Syncs slash commands globally across Discord
         await self.tree.sync()
         print("Slash commands synced globally.")
 
@@ -99,7 +97,7 @@ async def get_ai_answer(text_content, image_bytes=None):
         })
 
     payload = {
-        "model": "google/gemini-2.5-flash",
+        "model": "openrouter/free",  # Free tier fallback router
         "messages": [
             {"role": "system", "content": system_instruction},
             {"role": "user", "content": messages_content}
@@ -152,10 +150,57 @@ async def remove_user(interaction: discord.Interaction, user: discord.User):
     else:
         await interaction.response.send_message(f"User **{user.name}** was not in the access list.", ephemeral=True)
 
-@bot.tree.command(name="ping", description="Check the bot's current response latency.")
-async def ping(interaction: discord.Interaction):
-    latency = round(bot.latency * 1000)
-    await interaction.response.send_message(f"Pong! {latency}ms")
+@bot.tree.command(name="clear", description="Delete a specific number of messages.")
+@app_commands.describe(amount="Number of messages to delete")
+async def clear(interaction: discord.Interaction, amount: int):
+    if interaction.user.id not in allowed_users:
+        await interaction.response.send_message("ERROR: You do not have permission to use me!", ephemeral=True)
+        return
+    
+    await interaction.response.defer(ephemeral=True)
+    
+    # Check if we are in DMs or a regular channel
+    if isinstance(interaction.channel, discord.DMChannel):
+        deleted = 0
+        async for msg in interaction.channel.history(limit=amount):
+            if msg.author == bot.user:
+                try:
+                    await msg.delete()
+                    deleted += 1
+                except Exception:
+                    pass
+        await interaction.followup.send(f"Cleared {deleted} bot messages from DM history.", ephemeral=True)
+    else:
+        try:
+            deleted = await interaction.channel.purge(limit=amount)
+            await interaction.followup.send(f"Successfully deleted {len(deleted)} messages.", ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"Failed to clear messages: {e}", ephemeral=True)
+
+@bot.tree.command(name="clear-all", description="Delete all recent messages in the channel/DM.")
+async def clear_all(interaction: discord.Interaction):
+    if interaction.user.id not in allowed_users:
+        await interaction.response.send_message("ERROR: You do not have permission to use me!", ephemeral=True)
+        return
+    
+    await interaction.response.defer(ephemeral=True)
+    
+    if isinstance(interaction.channel, discord.DMChannel):
+        deleted = 0
+        async for msg in interaction.channel.history(limit=100):
+            if msg.author == bot.user:
+                try:
+                    await msg.delete()
+                    deleted += 1
+                except Exception:
+                    pass
+        await interaction.followup.send(f"Cleared all possible bot messages ({deleted}) from DM.", ephemeral=True)
+    else:
+        try:
+            deleted = await interaction.channel.purge(limit=100)
+            await interaction.followup.send(f"Successfully deleted {len(deleted)} messages.", ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"Failed to clear channel: {e}", ephemeral=True)
 
 @bot.tree.command(name="count", description="View total processed music theory questions.")
 async def count(interaction: discord.Interaction):
@@ -171,40 +216,47 @@ async def on_message(message):
     if message.author.bot:
         return
 
-    # Let the modern slash command architecture process interactions natively
-    # If it's a message in DMs or channels, check user security status
     if message.author.id not in allowed_users:
-        # Ignore normal casual channel chit-chat unless they specifically try talking to the bot directly in DMs
         if isinstance(message.channel, discord.DMChannel):
             await message.channel.send("ERROR: You do not have permission to use me!")
         return
 
     text_data = message.content
     image_data = None
-    
-    if message.attachments:
-        attachment = message.attachments[0]
-        if attachment.content_type and "image" in attachment.content_type:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(attachment.url) as resp:
-                    if resp.status == 200:
-                        image_data = await resp.read()
 
-    # Skip basic greeting checks or completely blank notifications so they don't count towards analytics
+    # Handle native Discord Forwards / Message Attachments
+    attachments_to_check = list(message.attachments)
+    
+    # If it's a layout forward reference containing snapshots or files
+    if message.reference and message.reference.cached_message:
+        ref_msg = message.reference.cached_message
+        if ref_msg.attachments:
+            attachments_to_check.extend(ref_msg.attachments)
+        if not text_data and ref_msg.content:
+            text_data = ref_msg.content
+
+    if attachments_to_check:
+        for attachment in attachments_to_check:
+            if attachment.content_type and "image" in attachment.content_type:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(attachment.url) as resp:
+                        if resp.status == 200:
+                            image_data = await resp.read()
+                            break # Grab the primary image resource
+
+    # Skip empty configurations or test triggers
     if not text_data and not image_data:
         return
-    if text_data.lower().strip() in ["hi", "hello", "hey", "test"]:
+    if text_data and text_data.lower().strip() in ["hi", "hello", "hey", "test"]:
         if isinstance(message.channel, discord.DMChannel):
-            await message.channel.send("System online. Send an analysis image or music theory request.")
+            await message.channel.send("System online. Send or forward an analysis image.")
         return
 
-    # True music theory analysis request triggered here
     async with message.channel.typing():
         answer = await get_ai_answer(text_data, image_data)
         
     await message.channel.send(answer)
     
-    # Increment tracking metrics exclusively on real query operations
     if not answer.startswith("Error:"):
         usage_count += 1
         save_data()
